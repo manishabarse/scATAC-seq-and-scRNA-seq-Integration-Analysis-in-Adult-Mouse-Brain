@@ -18,7 +18,7 @@ The scATAC-seq and scRNA-seq data used in this analysis were obtained from the 1
   - Pre-processed Seurat object: [allen-brain-RDS](https://signac-objects.s3.amazonaws.com/allen_brain.rds)
 
 ## Repository Contents
-- **analysis_script.Rmd**: This R Markdown file contains the code for the integration and analysis of scRNA-seq and scATAC-seq data.
+- **scatac-seq-adult-mouse-brain.Rmd**: This R Markdown file contains the code for the integration and analysis of scRNA-seq and scATAC-seq data.
 - **output.html**: The rendered HTML output of the analysis script.
 - **README.md**: This README file providing an overview of the project, its aim, data sources, and repository contents.
 
