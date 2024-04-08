@@ -1,0 +1,397 @@
+---
+title: "scATAC-seq analysis of adult mouse brain"
+author: "Manisha Barse"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache.lazy = FALSE)
+```
+
+```{r message=FALSE}
+library(Signac)
+library(Seurat)
+library(EnsDb.Mmusculus.v79)
+library(ggplot2)
+library(patchwork)
+set.seed(1234)
+```
+
+## Pre-processing workflow
+
+```{r cache = TRUE}
+counts <- Read10X_h5("atac_v1_adult_brain_fresh_5k_filtered_peak_bc_matrix.h5")
+```
+
+```{r cache = TRUE}
+#counts
+#157797 x 5337 sparse Matrix of class "dgCMatrix"
+
+```
+
+```{r cache = TRUE}
+metadata <- read.csv(
+  file = "atac_v1_adult_brain_fresh_5k_singlecell.csv",
+  header = TRUE,
+  row.names = 1
+)
+```
+
+
+```{r cache = TRUE}
+brain_assay <- CreateChromatinAssay(
+  counts = counts,
+  sep = c(":", "-"),
+  genome = "mm10",
+  fragments = 'atac_v1_adult_brain_fresh_5k_fragments.tsv.gz',
+  min.cells = 1
+)
+```
+
+```{r cache = TRUE}
+brain <- CreateSeuratObject(
+  counts = brain_assay,
+  assay = 'peaks',
+  project = 'ATAC',
+  meta.data = metadata
+)
+```
+
+```{r cache = TRUE}
+brain
+```
+
+By printing the assay we can see some of the additional information that can be contained in the ChromatinAssay, including motif information, gene annotations, and genome information.
+
+```{r cache = TRUE}
+brain[['peaks']]
+```
+
+Applying granges() to SeuratObject, to see the genomic ranges associated with each feature in the object. 
+
+```{r cache = TRUE}
+granges(brain)
+```
+
+Next, adding gene annotations to the brain object for the mouse genome. This will allow downstream functions to pull the gene annotation information directly from the object.
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# extract gene annotations from EnsDb
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+```
+
+```{r cache = TRUE}
+# change to UCSC style since the data was mapped to hg19
+seqlevels(annotations) <- paste0('chr', seqlevels(annotations))
+genome(annotations) <- "mm10"
+```
+
+```{r cache = TRUE}
+# add the gene information to the object
+Annotation(brain) <- annotations
+```
+
+## Computing QC Metrics
+
+```{r cache = TRUE}
+brain <- NucleosomeSignal(object = brain)
+```
+
+We can look at the fragment length periodicity for all the cells, and group by cells with high or low nucleosomal signal strength. You can see that cells which are outliers for the mononucleosomal or nucleosome-free ratio have different banding patterns. The remaining cells exhibit a pattern that is typical for a successful ATAC-seq experiment.
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+brain$nucleosome_group <- ifelse(brain$nucleosome_signal > 4, 'NS > 4', 'NS < 4')
+FragmentHistogram(object = brain, group.by = 'nucleosome_group', region = 'chr1-1-10000000')
+```
+The enrichment of Tn5 integration events at transcriptional start sites (TSSs)
+can also be an important quality control metric to assess the targeting of Tn5
+in ATAC-seq experiments. As per the ENCODE consortium, a TSS enrichment score is defined as
+the number of Tn5 integration site around the TSS normalized to the number of
+Tn5 integration sites in flanking regions. 
+
+```{r cache = TRUE}
+brain <- TSSEnrichment(brain, fast = FALSE)
+```
+
+```{r cache = TRUE}
+brain$high.tss <- ifelse(brain$TSS.enrichment > 2, 'High', 'Low')
+TSSPlot(brain, group.by = 'high.tss') + NoLegend()
+```
+
+```{r fig.width=18, fig.height=6, cache = TRUE, message=FALSE, warning=FALSE}
+brain$pct_reads_in_peaks <- brain$peak_region_fragments / brain$passed_filters * 100
+brain$blacklist_ratio <- brain$blacklist_region_fragments / brain$peak_region_fragments
+
+VlnPlot(
+  object = brain,
+  features = c('pct_reads_in_peaks', 'peak_region_fragments',
+               'TSS.enrichment', 'blacklist_ratio', 'nucleosome_signal'),
+  pt.size = 0.1,
+  ncol = 5
+)
+```
+
+Let us remove cells that are outliers for these QC metrics.
+
+```{r cache = TRUE}
+brain <- subset(
+  x = brain,
+  subset = peak_region_fragments > 3000 &
+    peak_region_fragments < 100000 &
+    pct_reads_in_peaks > 40 &
+    blacklist_ratio < 0.025 &
+    nucleosome_signal < 4 &
+    TSS.enrichment > 2
+)
+```
+
+```{r cache = TRUE}
+brain
+```
+
+## Normalization and linear dimensional reduction
+
+
+```{r cache = TRUE}
+# Running TF-IDF normalization on the brain dataset to transform the count matrix into a term frequency-inverse document frequency (TF-IDF) matrix, which weights the features by their importance.
+brain <- RunTFIDF(brain)
+
+# Finding top features based on TF-IDF scores above the minimum cutoff 'q0', ensuring that only informative features are retained for downstream analysis.
+brain <- FindTopFeatures(brain, min.cutoff = 'q0')
+
+# Running singular value decomposition (SVD) on the TF-IDF normalized data to perform linear dimensional reduction, capturing the main patterns of variation in the dataset.
+brain <- RunSVD(object = brain)
+```
+
+To assess if the first LSI component captures sequencing depth (technical variation) instead of biological variation, we can utilize the DepthCor() function to evaluate the correlation between each LSI component and sequencing depth. If a strong correlation is observed with sequencing depth, it suggests that the component should be removed from downstream analysis.
+
+```{r cache = TRUE}
+DepthCor(brain)
+```
+
+Here we observe a strong correlation between the first Latent Semantic Indexing (LSI) component and the total number of counts for the cell. Hence, we will proceed with downstream analysis excluding this component.
+
+## Non-linear dimension reduction and clustering
+
+Now that the cells are embedded in a low-dimensional space, we can use methods commonly applied for the analysis of scRNA-seq data to perform graph-based clustering and non-linear dimension reduction for visualization. These functions, `RunUMAP()`, `FindNeighbors()`, and `FindClusters()`, are all provided by the Seurat package.
+
+* RunUMAP function performs uniform manifold approximation and projection (UMAP) on the specified Seurat object using the latent semantic indexing (LSI) reduction method, retaining dimensions.
+
+* FindNeighbors function identifies the nearest neighbors for each cell in the Seurat object based on the specified reduction ('lsi') and dimensions (2 to 30) obtained from the LSI reduction, computes a shared nearest neighbor (SNN) graph to capture local cell similarities.
+
+* Finding clusters of cells based on their similarities in the lower-dimensional UMAP space.
+
+```{r cache = TRUE}
+# Perform dimensionality reduction using UMAP on the 'lsi' space with dimensions 2 to 30.
+brain <- RunUMAP(
+  object = brain,
+  reduction = 'lsi',
+  dims = 2:30
+)
+
+# Find nearest neighbors in the 'lsi' space with dimensions 2 to 30. 
+brain <- FindNeighbors(
+  object = brain,
+  reduction = 'lsi',
+  dims = 2:30
+)
+    
+# Find clusters in the UMAP space. Adjusting the resolution parameter to control the granularity of the identified cell clusters.
+brain <- FindClusters(
+  object = brain,
+  algorithm = 3,
+  resolution = 1.2,
+  verbose = FALSE
+)
+
+# Generate a UMAP-based visualization of the data with cluster labels.
+DimPlot(object = brain, label = TRUE) + NoLegend()
+```
+## Create a gene activity matrix
+
+Gene activity refers to the level of expression or activity of genes across different cells in the dataset.
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Compute gene activities from the Seurat object 'brain'
+gene.activities <- GeneActivity(brain)
+```
+
+Add the gene activity matrix to the Seurat object as a new assay named 'RNA'. This allows for easy access and manipulation of the gene activity data within the Seurat framework.
+
+```{r cache = TRUE}
+brain[['RNA']] <- CreateAssayObject(counts = gene.activities)
+```
+
+```{r cache = TRUE}
+# Normalize the gene activity data using the 'LogNormalize' method
+brain <- NormalizeData(
+  object = brain,
+  assay = 'RNA',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(brain$nCount_RNA)
+)
+```
+
+Normalization is performed to remove technical variations and ensure that the gene activity values are comparable across cells. The scale factor used for normalization is set to the median of the total counts of RNA in the dataset.
+
+```{r fig.width=12, fig.height=10, cache = TRUE}
+# Set the default assay of the Seurat object 'brain' to 'RNA'
+DefaultAssay(brain) <- 'RNA'
+
+# Generate a feature plot to visualize gene expression of specific genes
+FeaturePlot(
+  object = brain,
+  features = c('Sst','Pvalb',"Gad2","Neurod6","Rorb","Syt6"),
+  pt.size = 0.1,
+  max.cutoff = 'q95',
+  ncol = 3
+)
+```
+
+## Integrating scRNA-seq data with scATAC-seq data
+We can classify cells based on an scRNA-seq experiment from the adult mouse brain, to help interpret the scATAC-seq data. We utilize methods for cross-modality integration and label transfer, as described in the Seurat vignette.
+* Original methods described in the publication: [DOI: 10.1016/j.cell.2019.05.031](https://doi.org/10.1016/j.cell.2019.05.031)
+* More in-depth tutorial available [here](https://satijalab.org/seurat/v3.0/atacseq_integration_vignette.html)
+
+* Raw data for the scRNA-seq experiment can be downloaded from the [Allen Institute website](http://celltypes.brain-map.org/api/v2/well_known_file_download/694413985)
+* Code used to construct the Seurat object can be found on [GitHub](https://github.com/satijalab/Integration2019/blob/master/preprocessing_scripts/allen_brain.R)
+
+* Alternatively, you can download the pre-processed Seurat object from [here](https://signac-objects.s3.amazonaws.com/allen_brain.rds)
+
+
+```{r cache = TRUE}
+# Load the pre-processed scRNA-seq data from the file 'allen_brain.rds' and update the Seurat object.
+allen_rna <- readRDS("allen_brain.rds")
+allen_rna <- UpdateSeuratObject(allen_rna)
+allen_rna <- FindVariableFeatures(
+  object = allen_rna,
+  nfeatures = 5000
+)
+```
+
+Identify the top 5000 variable features in the scRNA-seq data.
+
+```{r cache = TRUE}
+# Find anchors between the scRNA-seq and scATAC-seq datasets using canonical correlation analysis (CCA) on dimensions 1 to 30. 
+transfer.anchors <- FindTransferAnchors(
+  reference = allen_rna,
+  query = brain,
+  reduction = 'cca',
+  dims = 1:30
+)
+```
+
+```{r cache = TRUE}
+# Transfer labels from the scRNA-seq data to the scATAC-seq data using the identified anchors and dimensionality reduction results from the scATAC-seq data.
+predicted.labels <- TransferData(
+  anchorset = transfer.anchors,
+  refdata = allen_rna$subclass,
+  weight.reduction = brain[['lsi']],
+  dims = 2:30
+)
+```
+
+```{r cache = TRUE}
+# Add the predicted cell labels from the scRNA-seq data as metadata to the scATAC-seq object.
+brain <- AddMetaData(object = brain, metadata = predicted.labels)
+```
+
+Create UMAP visualizations for both scRNA-seq and scATAC-seq data, with cells colored by subclass (scRNA-seq) and predicted cell labels (scATAC-seq).
+
+```{r fig.width=12, cache = TRUE}
+plot1 <- DimPlot(allen_rna, group.by = 'subclass', label = TRUE, repel = TRUE) + NoLegend() + ggtitle('scRNA-seq')
+plot2 <- DimPlot(brain, group.by = 'predicted.id', label = TRUE, repel = TRUE) + NoLegend() + ggtitle('scATAC-seq')
+plot1 + plot2
+```
+
+Integrating scRNA-seq with scATAC-seq, we validate scATAC-seq clustering using scRNA-seq cell type labels. Anchors are identified between datasets, transferring scRNA-seq labels to scATAC-seq cells. Using canonical correlation analysis (CCA), we establish cross-modality correspondences. Cell type labels from scRNA-seq are transferred to scATAC-seq. Comparing RNA-based classifications to scATAC-seq UMAP clusters ensures consistency. This validation boosts confidence in scATAC-seq cluster annotations and facilitates comprehensive biological interpretation of single-cell chromatin accessibility data.
+
+We see consistent alignment between RNA-based classifications and the UMAP visualization, derived solely from ATAC-seq data
+
+
+## Find differentially accessible peaks between clusters
+
+In this section, we identify differentially accessible regions among excitatory neurons across various cortical layers.
+
+```{r cache = TRUE}
+#Switching back to working with peaks instead of gene activities and setting cluster identities
+DefaultAssay(brain) <- 'peaks'
+Idents(brain) <- "predicted.id"
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Finding differentially accessible peaks between clusters of excitatory neurons in different layers of the cortex
+da_peaks <- FindMarkers(
+  object = brain,
+  ident.1 = c("L2/3 IT"), 
+  ident.2 = c("L4", "L5 IT", "L6 IT"),
+  test.use = 'LR',
+  latent.vars = 'nCount_peaks'
+)
+```
+
+```{r cache = TRUE}
+# Displaying the first few rows of the differentially accessible peaks table
+head(da_peaks)
+```
+
+```{r fig.width=12, cache = TRUE}
+# Creating violin and feature plots to visualize differentially accessible peaks
+plot1 <- VlnPlot(
+  object = brain,
+  features = rownames(da_peaks)[1],
+  pt.size = 0.1,
+  idents = c("L4","L5 IT","L2/3 IT")
+)
+plot2 <- FeaturePlot(
+  object = brain,
+  features = rownames(da_peaks)[1],
+  pt.size = 0.1,
+  max.cutoff = 'q95'
+)
+plot1 | plot2
+```
+
+```{r cache = TRUE}
+# Identifying the closest features to significantly differentially accessible peaks in L2/3 IT cluster
+open_l23 <- rownames(da_peaks[da_peaks$avg_log2FC > 3, ])
+closest_l23 <- ClosestFeature(brain, open_l23)
+
+head(closest_l23)
+```
+
+```{r cache = TRUE}
+# Identifying the closest features to significantly differentially accessible peaks in L4, L5 IT, and L6 IT clusters
+open_l456 <- rownames(da_peaks[da_peaks$avg_log2FC < 3, ])
+closest_l456 <- ClosestFeature(brain, open_l456)
+
+head(closest_l456)
+```
+
+## Plotting genomic regions
+
+We can create coverage plots for genomic regions grouped by cluster, cell type, or any other metadata stored in the object using the CoveragePlot() function. These plots visualize the pseudo-bulk accessibility tracks, averaging signal from all cells within a group to represent DNA accessibility in a region.
+
+```{r out.width="90%", fig.height=10}
+# Plotting coverage plots for genomic regions
+
+# show cell types with at least 50 cells
+idents.plot <- names(which(table(Idents(brain)) > 50)) # Filtering cell types with at least 50 cells
+
+CoveragePlot(
+  object = brain,
+  region = c("Neurod6", "Gad2"),
+  idents = idents.plot,
+  extend.upstream = 1000,
+  extend.downstream = 1000,
+  ncol = 1
+)
+```
+
+```{r cache = TRUE}
+# Saving the Seurat object as an RDS file
+saveRDS(object = brain, file = "adult_mouse_brain.rds")
+```
