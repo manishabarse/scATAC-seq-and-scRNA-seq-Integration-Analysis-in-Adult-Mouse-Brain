@@ -33,7 +33,7 @@ The scATAC-seq and scRNA-seq data used in this analysis were obtained from the 1
 To reproduce the analysis:
 1. Clone or download this repository.
 2. Ensure that the required data files are placed in the appropriate directory.
-3. Open and run the `analysis_script.Rmd` file in RStudio or any other compatible environment.
+3. Open and run the `scatac-seq-adult-mouse-brain.Rmd` file in RStudio or any other compatible environment.
 4. Follow the instructions provided in the analysis script to execute the analysis steps.
 
 ## Acknowledgments
